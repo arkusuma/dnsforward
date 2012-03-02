@@ -17,59 +17,69 @@
 require 'socket'
 
 class DNSForwarder
-  attr_accessor :dns_addr, :dns_port, :bind_addr, :bind_port
+  attr_accessor :dns_addr, :dns_port, :dns_mode, :bind_addr, :bind_port
 
-  def initialize(dns_addr, dns_port, bind_addr = '127.0.0.1', bind_port = 53)
-    @bind_addr = bind_addr
-    @bind_port = bind_port
+  def initialize(dns_addr, dns_port, dns_mode, bind_addr = '127.0.0.1', bind_port = 53)
     @dns_addr = dns_addr
     @dns_port = dns_port
+    @dns_mode = dns_mode
+    @bind_addr = bind_addr
+    @bind_port = bind_port
   end
 
   def start
     @works = []
     @mutex = Mutex.new
-    @udp = UDPSocket.new
-    @udp.bind @bind_addr, @bind_port
-    while true
-      request, client = @udp.recvfrom 512
-      resolve request, client
+    Socket.udp_server_loop(@bind_addr, @bind_port) do |msg, src|
+      resolve msg, src
     end
   end
 
-  def resolve(request, client)
-    key = "#{client[3]}:#{client[1]}"
+  def resolve(msg, src)
     @mutex.synchronize do
-      return if @works.include? key
-      @works << key
+      return if @works.include? src.remote_address
+      @works << src.remote_address
     end
 
     Thread.new do
-      Socket.tcp @dns_addr, @dns_port do |tcp|
-        tcp.write [request.size].pack('n') + request
-        tcp.close_write
-        len = tcp.read(2).unpack('n')[0]
-        response = tcp.read(len)
-        @udp.send response, 0, client[3], client[1]
+      sock = nil
+      begin
+        if @dns_mode == :tcp
+          sock = TCPSocket.new @dns_addr, @dns_port
+          sock.write [msg.size].pack('n') + msg
+          sock.close_write
+          len = sock.read(2).unpack('n')[0]
+          src.reply(sock.read len)
+        else
+          sock = UDPSocket.new
+          sock.send msg, 0, @dns_addr, @dns_port
+          src.reply(sock.recv 512)
+        end
+      ensure
+        sock.close
+        @mutex.synchronize { @works.delete src.remote_address }
       end
-      @mutex.synchronize { @works.delete key }
     end
   end
 end
 
 if ARGV.include? '-h' or ARGV.include? '--help'
-  puts "Usage: dnsforward [dns_addr] [dns_port] [bind_addr] [bind_port]"
-  puts "Forward local UDP DNS request to a remote TCP DNS server."
+  puts "Usage: dnsforward [dns_addr] [dns_port] [dns_mode] [bind_addr] [bind_port]"
+  puts "Forward local UDP DNS request to a remote UDP/TCP DNS server."
   exit
 end
 
-dns_addr, dns_port = '87.118.100.175', 110
-bind_addr, bind_port = '127.0.0.1', 53
+#dns_addr, dns_port, dns_mode = '87.118.100.175', 110, :tcp
+dns_addr, dns_port, dns_mode = '208.67.222.222', 5353, :udp
+#dns_addr, dns_port, dns_mode = '208.67.220.220', 5353, :udp
+
+bind_addr, bind_port = '0.0.0.0', 53
 
 dns_addr = ARGV[0] if ARGV.count > 0
 dns_port = ARGV[1] if ARGV.count > 1
-bind_addr = ARGV[2] if ARGV.count > 2
-bind_port = ARGV[3] if ARGV.count > 3
+dns_mode = (ARGV[2] == 'tcp' ? :tcp : :udp) if ARGV.count > 2
+bind_addr = ARGV[3] if ARGV.count > 3
+bind_port = ARGV[4] if ARGV.count > 4
 
-dns = DNSForwarder.new dns_addr, dns_port, bind_addr, bind_port
+dns = DNSForwarder.new dns_addr, dns_port, dns_mode, bind_addr, bind_port
 dns.start
